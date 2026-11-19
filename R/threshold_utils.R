@@ -173,11 +173,19 @@ percent.days.op.threshold <- function(temp, dates, jdays, date.factor, threshold
 #' @param base.thresholds Optional in-base bootstrap thresholds, as found in
 #' the 'inbase' member of a climdexInput object's quantiles (an array of
 #' dimension days of year x base years x (base years - 1)). If supplied
-#' together with \code{dates} and \code{base.range}, the index for each
-#' period inside the base period is computed once with each set of bootstrap
-#' thresholds for that year and the results are averaged, following Zhang et
-#' al. (2005). This removes the artificial jump at the edges of the base
-#' period, in the same way as for \code{\link{percent.days.op.threshold}}.
+#' together with \code{dates} and \code{base.range}, periods lying within a
+#' single base year are computed with the Zhang et al. (2005) bootstrap, as
+#' for \code{\link{percent.days.op.threshold}}: for base year y, each of the
+#' (n - 1) threshold sets estimated with year y replaced by another base year
+#' is applied to all the days used to find the spells of year y (year y alone,
+#' or years y - 1 to y + 1 if \code{spells.can.span.years} is TRUE, so that a
+#' spell crossing a year boundary is evaluated with a single threshold set),
+#' and the results are averaged. The result does not depend on the order of
+#' the samples. A bootstrap sample is not used for a period if any day in the
+#' period has data but no threshold in that sample (a missing threshold would
+#' otherwise count as a non-exceedance); if no samples remain the period is NA. If
+#' the base period has fewer than two years there are no replacement years,
+#' and the out-of-base thresholds are used.
 #' If NULL (the default), the out-of-base thresholds are used for all days.
 #' @param base.range Date range (type PCICt) of the baseline period. Only
 #' needed when \code{base.thresholds} is supplied.
@@ -224,26 +232,13 @@ threshold.exceedance.duration.index <- function(daily.temp, date.factor, jdays, 
   exceed <- f(daily.temp, thresholds[jdays])
   result <- spell.days(exceed)
 
-  ## Zhang et al. (2005) bootstrap for periods inside the base period, as in
-  ## percent.days.op.threshold. For each base year, the index is computed
-  ## with each of the (n - 1) sets of thresholds estimated with that year
-  ## replaced by another base year, and the results are averaged.
-  if(!is.null(base.thresholds) && !is.null(dates) && !is.null(base.range)) {
-    inset <- dates >= base.range[1] & dates <= base.range[2]
-    ## Don't use in-base thresholds with data shorter than two years; no years to replace with.
-    if(sum(inset) > 0 && length(dates) >= 360 * 2) {
-      bdim <- dim(base.thresholds)
-      jdays.base <- jdays[inset]
-      byr.indices <- get.years(dates[inset]) - get.years(base.range)[1] + 1
-      bs.results <- sapply(1:bdim[3], function(k) {
-        exceed.k <- exceed
-        exceed.k[inset] <- f(daily.temp[inset], base.thresholds[cbind(jdays.base, byr.indices, k)])
-        spell.days(exceed.k)
-      })
-      bs.results <- matrix(bs.results, ncol=bdim[3])
-      base.periods <- names(result) %in% unique(as.character(date.factor[inset]))
-      result[base.periods] <- rowMeans(bs.results[base.periods, , drop=FALSE])
-    }
+  ## Zhang et al. (2005) bootstrap for periods inside the base period; see
+  ## bootstrap.spell.days below.
+  if(!is.null(base.thresholds)) {
+    if(is.null(dates) || is.null(base.range))
+      stop("dates and base.range must be supplied with base.thresholds.")
+    result <- bootstrap.spell.days(daily.temp, dates, jdays, date.factor, base.thresholds, base.range,
+                                   f, min.length, spells.can.span.years, result)
   }
   return(result * na.mask)
 }
@@ -431,4 +426,77 @@ spell.length.max <- function(daily.prec, date.factor, threshold, op, spells.can.
 total.precip.op.threshold <- function(daily.prec, date.factor, threshold, op) {
   f <- match.fun(op)
   return(tapply.fast(daily.prec, date.factor, function(pr) { return(sum(pr[f(pr, threshold)], na.rm=TRUE)) } ))
+}
+## Internal: Zhang et al. (2005) bootstrap for the spell-duration indices.
+## base.thresholds[, y, k] is the set of thresholds estimated with base year y
+## replaced by the k-th of the other base years. Each (y, k) set is a complete
+## day-of-year climatology for evaluating year y, so it is applied to every day
+## used to find the spells of year y: year y alone, or years y - 1 to y + 1 if
+## spells can span years (so a spell crossing a year boundary is evaluated with
+## one threshold set). Periods lying within a single base year get the mean over
+## the n - 1 sets; other periods keep their out-of-base values. A sample is not
+## used for a period if any day in the period has data but no threshold in that
+## sample (a missing threshold would otherwise count as a non-exceedance and
+## shorten or remove spells); the period value is the mean of the remaining
+## samples, or NA if none remain. Missing data are handled as for the
+## out-of-base thresholds.
+bootstrap.spell.days <- function(daily.temp, dates, jdays, date.factor, base.thresholds, base.range,
+                                 f, min.length, spells.can.span.years, result) {
+  inset <- dates >= base.range[1] & dates <= base.range[2]
+  if(!any(inset))
+    return(result)
+  base.years <- get.years(base.range)
+  n.base <- base.years[2] - base.years[1] + 1
+  bdim <- dim(base.thresholds)
+  if(length(bdim) != 3)
+    stop("base.thresholds must be a 3-dimensional array (day of year x base year x sample).")
+  ## Fewer than two base years: no replacement years, so no bootstrap samples.
+  if(n.base < 2 || bdim[3] < 1)
+    return(result)
+  if(bdim[2] != n.base || bdim[3] != n.base - 1)
+    stop(sprintf("base.thresholds has dimensions %s, but base.range spans %d years (expected %d years x %d samples).",
+                 paste(bdim, collapse=" x "), n.base, n.base, n.base - 1))
+  if(max(jdays[inset]) > bdim[1])
+    stop("base.thresholds has fewer days of year than the data in the base period.")
+
+  years <- get.years(dates)
+  fac <- as.character(date.factor)
+  for(y in base.years[1]:base.years[2]) {
+    in.y <- which(years == y)
+    if(length(in.y) == 0)
+      next
+    ## Periods lying entirely within year y.
+    per <- unique(fac[in.y])
+    per <- per[vapply(per, function(p) all(years[fac == p] == y), logical(1))]
+    if(length(per) == 0)
+      next
+    win <- if(spells.can.span.years) which(years >= y - 1 & years <= y + 1) else in.y
+    yi <- y - base.years[1] + 1
+    fac.win <- fac[win]
+    per.idx <- lapply(per, function(p) which(fac.win == p))
+    temp.win <- daily.temp[win]
+    ## All (n - 1) threshold sets for year y at once: days x samples.
+    thr <- base.thresholds[jdays[win], yi, , drop=FALSE]
+    dim(thr) <- c(length(win), bdim[3])
+    exceed <- f(temp.win, thr)
+    dim(exceed) <- dim(thr)
+    ## Days with data but no threshold in a sample.
+    no.thr <- is.na(thr) & !is.na(temp.win)
+    samples <- vapply(1:bdim[3], function(k) {
+      e <- exceed[, k]
+      spells <- if(spells.can.span.years) select.blocks.gt.length(e, min.length - 1) else NULL
+      vapply(per.idx, function(i) {
+        ## A missing threshold would be read as a non-exceedance and could
+        ## shorten or remove a spell, so the sample is not used for this period.
+        if(any(no.thr[i, k])) return(NA_real_)
+        ## fclimdex behaviour unless spells.can.span.years: spells end at period boundaries.
+        as.numeric(if(spells.can.span.years) sum(spells[i]) else sum(select.blocks.gt.length(e[i], min.length - 1)))
+      }, numeric(1))
+    }, numeric(length(per)))
+    samples <- matrix(samples, nrow=length(per))
+    m <- rowMeans(samples, na.rm=TRUE)
+    m[is.nan(m)] <- NA
+    result[per] <- m
+  }
+  return(result)
 }
